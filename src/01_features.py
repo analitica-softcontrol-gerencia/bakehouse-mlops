@@ -19,6 +19,7 @@
 
 # COMMAND ----------
 
+# Cambio de prueba en la rama new_feature: valida que Git y Databricks reconozcan la modificación.
 dbutils.widgets.text("catalog", "workspace")
 dbutils.widgets.text("schema", "bakehouse_dev")
 #testing
