@@ -221,7 +221,24 @@ display(hijos[["tags.mlflow.runName", "params.familia", "metrics.mejor_cv_f1"]])
 
 # COMMAND ----------
 
-# TODO: agrega la familia "vecinos" al diccionario familias y reabre el estudio con run_id=ID_ESTUDIO
+from sklearn.neighbors import KNeighborsClassifier
+
+familias["vecinos"] = (
+    lambda p: make_pipeline(StandardScaler(), KNeighborsClassifier(**p)),
+    [{"n_neighbors": k} for k in [3, 7, 15]],
+)
+
+# Con el estudio reabierto como run activo, correr_familia crea la familia como hijo suyo.
+with mlflow.start_run(run_id=ID_ESTUDIO):
+    resultado_vecinos = correr_familia("vecinos")
+    mejores_por_familia.append(resultado_vecinos)
+    if resultado_vecinos["cv_f1"] > ganador["cv_f1"]:
+        ganador = resultado_vecinos
+        mlflow.set_tag("familia_ganadora", "vecinos")
+        mlflow.log_metric("mejor_cv_f1", ganador["cv_f1"])
+
+display(pd.DataFrame(mejores_por_familia))
+print(f"Ganador: {ganador['familia']} {ganador['params']} · cv_f1 {ganador['cv_f1']:.4f}")
 
 
 # COMMAND ----------
@@ -315,7 +332,31 @@ print(f"Mejor de Optuna: {estudio_optuna.best_params} · cv_f1 {estudio_optuna.b
 
 # COMMAND ----------
 
-# TODO: define objetivo_v2 con max_features y corre el estudio dentro del padre optuna_random_forest_v2
+def objetivo_v2(trial: optuna.Trial) -> float:
+    params = {
+        "n_estimators": trial.suggest_int("n_estimators", 50, 300, step=50),
+        "max_depth": trial.suggest_int("max_depth", 2, 12),
+        "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 10),
+        "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2", None]),
+    }
+    with mlflow.start_run(run_name=f"trial_{trial.number:02d}", nested=True):
+        puntajes = cross_val_score(
+            RandomForestClassifier(random_state=42, **params), X_train, y_train, cv=folds, scoring="f1"
+        )
+        mlflow.log_params(params)
+        mlflow.log_metric("cv_f1_media", puntajes.mean())
+    return float(puntajes.mean())
+
+
+# Variable aparte: la sección 5 sigue usando estudio_optuna (la versión sin max_features).
+with mlflow.start_run(run_name="optuna_random_forest_v2"):
+    estudio_optuna_v2 = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
+    estudio_optuna_v2.optimize(objetivo_v2, n_trials=N_INTENTOS)
+    mlflow.log_params({f"mejor_{k}": v for k, v in estudio_optuna_v2.best_params.items()})
+    mlflow.log_metric("mejor_cv_f1", estudio_optuna_v2.best_value)
+
+print(f"v1: cv_f1 {estudio_optuna.best_value:.4f} · v2: cv_f1 {estudio_optuna_v2.best_value:.4f}")
+print(f"Mejores parámetros v2: {estudio_optuna_v2.best_params}")
 
 
 # COMMAND ----------
@@ -522,7 +563,24 @@ display(cargado.predict(X_test.head(5), params={"umbral": 0.3}))
 
 # COMMAND ----------
 
-# TODO: barre umbrales con cargado.predict(X_test, params={"umbral": u}) y registra costo y recall por paso
+umbrales_barrido = np.round(np.arange(0.05, 0.951, 0.05), 2)
+costos = {}
+
+with mlflow.start_run(run_name="barrido_umbral"):
+    mlflow.log_param("modelo_base", nombre_elegido)
+    for u in umbrales_barrido:
+        pred_u = cargado.predict(X_test, params={"umbral": float(u)})["prediccion"]
+        paso = int(round(u * 100))
+        costos[float(u)] = costo_negocio(y_test, pred_u)
+        mlflow.log_metric("costo_negocio", costos[float(u)], step=paso)
+        mlflow.log_metric("recall", recall_score(y_test, pred_u), step=paso)
+
+    # Si hay empate en el costo, min se queda con el umbral más bajo.
+    umbral_optimo = min(costos, key=costos.get)
+    mlflow.log_param("umbral_optimo", umbral_optimo)
+    mlflow.log_metric("costo_minimo", costos[umbral_optimo])
+
+print(f"Umbral óptimo: {umbral_optimo} · costo {costos[umbral_optimo]:.3f}")
 
 
 # COMMAND ----------
@@ -560,13 +618,18 @@ print(f"Versión {version.version} ({nombre_elegido}) → @champion · validaci�
 
 # MAGIC %md
 # MAGIC ### Buscar versiones y modelos
-# MAGIC - `search_model_versions` filtra versiones registradas por nombre y tags.
+# MAGIC - `search_model_versions` filtra versiones registradas por nombre; en Unity Catalog no devuelve
+# MAGIC   tags ni aliases, así que se piden con `get_model_version`.
 # MAGIC - `search_logged_models` (MLflow 3) busca **todos los modelos guardados** en el experimento,
 # MAGIC   estén registrados o no, ordenados por las métricas que les asociamos con `model_id`.
 
 # COMMAND ----------
 
-versiones = cliente.search_model_versions(f"name = '{NOMBRE_MODELO}'")
+# En Unity Catalog la búsqueda no trae tags ni aliases: pedimos cada versión completa.
+versiones = [
+    cliente.get_model_version(NOMBRE_MODELO, v.version)
+    for v in cliente.search_model_versions(f"name = '{NOMBRE_MODELO}'")
+]
 display(
     pd.DataFrame(
         [
